@@ -1,0 +1,125 @@
+# The macOS release of Tuga Stats Lens (Task 75 macOS, docs/release.md §macOS).
+#
+# This file lives in the PRIVATE repository (scripts/macos/github/release-macos.yml) and is
+# copied by hand to the PUBLIC releases repository as .github/workflows/release-macos.yml (free
+# macOS runners; the code stays private and is read with a fine-grained read-only token). Keep
+# it thin: everything else is scripts/macos/release-mac.mjs at the commit being built.
+#
+# Runs when `make release` (Windows) publishes `v<version>`, or by hand (Actions → macOS → Run
+# workflow) with the version and, for releases older than Task 75 macOS, the commit.
+#
+# Secrets of the releases repository (docs/release.md §macOS):
+#   LENS_SOURCE_TOKEN            fine-grained PAT, nuno1197/tugastats-lens only, Contents: read
+#   LENS_PACK_SIGNING_KEY        macOS pack key (ed25519 seed, hex), make release-keys-mac
+#   TAURI_SIGNING_PRIVATE_KEY    macOS updater key (minisign), make release-keys-mac
+#   MACOS_CERTIFICATE            optional: the "Lens Local" certificate (.p12, base64), so the
+#   MACOS_CERTIFICATE_PASSWORD   app keeps the identity the Keychain knows; ad hoc without it
+name: macOS
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Versão da app já publicada (ex. 0.7.0)
+        required: true
+      ref:
+        description: Commit do repositório privado (vazio = lens.commit do latest.json)
+        required: false
+      force:
+        description: Refazer mesmo que o latest.json já tenha darwin-aarch64
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-macos
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'v')
+    runs-on: macos-15
+    timeout-minutes: 300
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      VERSION: ${{ inputs.version || github.event.release.tag_name }}
+      INPUT_REF: ${{ inputs.ref }}
+      FORCE: ${{ inputs.force && '1' || '0' }}
+      LENS_MAC_TOOLS: /Users/runner/lens-tools
+    steps:
+      - name: Commit a construir
+        id: ref
+        run: |
+          set -euo pipefail
+          v="${VERSION#v}"
+          ref="$INPUT_REF"
+          if [ -z "$ref" ]; then
+            gh release download "v$v" --repo "$REPO" --pattern latest.json --dir "$RUNNER_TEMP"
+            ref="$(jq -r '.lens.commit // empty' "$RUNNER_TEMP/latest.json")"
+          fi
+          if [ -z "$ref" ]; then
+            echo "O latest.json da v$v não tem lens.commit: corre o workflow à mão com o ref."
+            exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: nuno1197/tugastats-lens
+          ref: ${{ steps.ref.outputs.ref }}
+          token: ${{ secrets.LENS_SOURCE_TOKEN }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: astral-sh/setup-uv@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Ferramentas de build
+        run: brew install zstd cmake ninja meson pkgconf
+
+      - name: Cache do FFmpeg LGPL e do OpenCV sem FFmpeg
+        uses: actions/cache@v4
+        with:
+          path: /Users/runner/lens-tools
+          key: lens-tools-${{ hashFiles('engine/pack/build_ffmpeg_macos.sh', 'engine/pack/build_opencv_macos.sh', 'engine/uv.lock') }}
+
+      - name: Certificado "Lens Local"
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$MACOS_CERTIFICATE" ]; then
+            echo "sem certificado: assinatura ad hoc"
+            echo "APPLE_SIGNING_IDENTITY=-" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          kc="$RUNNER_TEMP/lens.keychain-db"
+          kpw="$(uuidgen)"
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/lens.p12"
+          security create-keychain -p "$kpw" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$kpw" "$kc"
+          security import "$RUNNER_TEMP/lens.p12" -k "$kc" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$kpw" "$kc" >/dev/null
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          security find-certificate -c "Lens Local" -p "$kc" > "$RUNNER_TEMP/lens.pem"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/lens.pem"
+          rm -f "$RUNNER_TEMP/lens.p12" "$RUNNER_TEMP/lens.pem"
+          echo "APPLE_SIGNING_IDENTITY=Lens Local" >> "$GITHUB_ENV"
+
+      - name: Dependências da UI
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Pack, app e latest.json
+        env:
+          LENS_PACK_SIGNING_KEY: ${{ secrets.LENS_PACK_SIGNING_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: node scripts/macos/release-mac.mjs build
